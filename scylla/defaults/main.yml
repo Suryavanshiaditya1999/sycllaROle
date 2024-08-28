@@ -1,0 +1,14 @@
+---
+version: "6.0"
+apt_key: "491c93b9de7496a7"
+scylla_madison: "6.0.2-0.20240703.c9cd171f426e-1 "
+scylla_setup_opts:
+  - "--no-raid-setup"
+  - "--online-discard 1"
+  - "--no-sysconfig-setup"
+  - "--io-setup 0"
+  - "--no-cpuscaling-setup"
+  - "--no-rsyslog-setup"
+endpoint_snitch: Ec2Snitch
+Cluster_Name: "Test Cluster"
+

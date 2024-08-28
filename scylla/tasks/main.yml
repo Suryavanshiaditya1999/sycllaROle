@@ -1,0 +1,216 @@
+---
+
+- name: Store private IP address of the first server >>>>>>>>>>
+  set_fact:
+    first_server_private_ip: "{{ hostvars[groups['all'][0]]['ansible_default_ipv4']['address'] }}"
+
+
+- name: Create directory for apt keyrings >>>>>>>>>>>>
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+
+- name: Import ScyllaDB GPG key >>>>>>>>
+  command: >
+    sudo gpg --homedir /tmp --no-default-keyring --keyring /etc/apt/keyrings/scylladb.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys {{ apt_key }}
+
+
+- name: Add ScyllaDB repository >>>>>>>>>>>
+  get_url:
+    url: http://downloads.scylladb.com/deb/debian/scylla-{{ version }}.list
+    dest: /etc/apt/sources.list.d/scylla.list
+
+- name: Update apt cache >>>>>>>>>>>>
+  apt:
+    update_cache: yes
+
+- name: Install ScyllaDB and OpenJDK 11 >>>>>>>>
+  apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - openjdk-11-jre-headless
+    - scylla
+
+- name: Installing ScyllaDB requirements >>>>>>>>>
+  apt:
+    name:
+      - scylla={{ scylla_madison }}
+      - scylla-server={{ scylla_madison }}
+      - scylla-jmx={{ scylla_madison }}
+      - scylla-tools={{ scylla_madison }}
+      - scylla-tools-core={{ scylla_madison }}
+      - scylla-kernel-conf={{ scylla_madison }}
+      - scylla-node-exporter={{ scylla_madison }}
+      - scylla-conf={{ scylla_madison }}
+      - scylla-python3={{ scylla_madison }}
+    state: present
+    update_cache: yes
+
+
+
+- name: Run ScyllaDB setup >>>>>>>>>>>>>
+  command: >
+    scylla_setup --no-raid-setup --online-discard 1 --no-sysconfig-setup
+    --io-setup 0 --no-cpuscaling-setup --no-rsyslog-setup
+
+- name: Run ScyllaDB I/O setup >>>>>>>>>>>>>>
+  command: scylla_io_setup
+
+- name: Copy ScyllaDB configuration file >>>>>>>>>>>
+  template:
+    src: scylla.yaml.j2
+    dest: /etc/scylla/scylla.yaml
+  notify: Start ScyllaDB service
+
+
+- name: Gather service facts
+  service_facts:
+
+- name: Check ScyllaDB service state
+  debug:
+    msg: "ScyllaDB service state on {{ ansible_hostname }} is {{ ansible_facts.services['scylla-server'].state }}."
+  when: "'scylla-server' in ansible_facts.services and ansible_facts.services['scylla-server'].state != 'running'"
+  notify: restart scylla-server
+
+
+- name: Starting ScyllaDB >>>>>>>>>>
+  command: >
+    sudo systemctl start scylla-server
+
+- name: Login to ScyllaDB with Cassandra user and create a new user >>>>>>>>>>
+  command: >
+    cqlsh {{ first_server_private_ip }} -u cassandra -p cassandra -e "CREATE ROLE scylladb WITH PASSWORD = 'password' AND LOGIN = true; GRANT CREATE ON ALL KEYSPACES TO scylladb;"
+
+- name: Login to ScyllaDB with new scylladb user and create keyspace >>>>>>>>>>
+  command: >
+    cqlsh {{ first_server_private_ip }} -u scylladb -p password -e "CREATE KEYSPACE employee_db WITH REPLICATION = {'class' : 'SimpleStrategy', 'replication_factor' : 1};"
+
+
+
+- name: Create employee_info table in employee_db keyspace 
+  command: >
+    cqlsh {{ first_server_private_ip }} -u scylladb -p password -e "CREATE TABLE IF NOT EXISTS employee_db.employee_info (id text, name text, designation text, department text, joining_date date, address text, office_location text, status text, email text, phone_number text, PRIMARY KEY (id, joining_date)) WITH CLUSTERING ORDER BY (joining_date DESC);"
+
+
+- name: Create employee_salary table in employee_db keyspace 
+  command: >
+    cqlsh {{ first_server_private_ip }} -u scylladb -p password -e "CREATE TABLE IF NOT EXISTS employee_db.employee_salary (id text, process_date text, name text, salary float, status text, PRIMARY KEY (id, process_date)) WITH CLUSTERING ORDER BY (process_date DESC);"
+
+- name: Insert data into employee_info table in employee_db keyspace
+  command: >
+    cqlsh {{ first_server_private_ip }} -u scylladb -p password -e "INSERT INTO employee_db.employee_info (id, name, designation, department, joining_date, address, office_location, status, email, phone_number) VALUES ('1', 'Bhavnesh', 'DevOps Specialist', 'Tech', '2024-04-24', 'Agra', 'Noida', 'Current Employee', 'bhavnesh.baghel.snaatak@mygurukulam.co', '9999999999');"
+
+#### Tasks for Promtail
+
+- name: Ensure unzip is installed
+  apt:
+    name: unzip
+    state: present
+    update_cache: yes
+
+- name: Set Promtail version
+  set_fact:
+    promtail_version: "2.4.1"
+
+- name: Check CPU architecture
+  command: uname -m
+  register: architecture
+
+- name: Set Promtail download URL
+  set_fact:
+    promtail_binary_url: "https://github.com/grafana/loki/releases/download/v{{ promtail_version }}/promtail-linux-amd64.zip"
+  when: architecture.stdout == "x86_64"
+
+- name: Fail if architecture is unsupported
+  fail:
+    msg: "Unsupported architecture: {{ architecture.stdout }}"
+  when: architecture.stdout != "x86_64"
+
+- name: Download Promtail binary
+  get_url:
+    url: "{{ promtail_binary_url }}"
+    dest: /tmp/promtail-linux-amd64.zip
+
+- name: Extract Promtail binary
+  unarchive:
+    src: /tmp/promtail-linux-amd64.zip
+    dest: /tmp/
+    remote_src: yes
+
+- name: Make the binary executable
+  file:
+    path: /tmp/promtail-linux-amd64
+    mode: '0755'
+
+- name: Move binary to /usr/local/bin/
+  copy:
+    src: /tmp/promtail-linux-amd64
+    dest: /usr/local/bin/promtail
+    remote_src: yes
+    mode: '0755'
+
+- name: Verify Promtail installation
+  command: promtail --version
+  register: promtail_version_check
+  ignore_errors: yes
+
+- name: Fail if Promtail installation verification fails
+  fail:
+    msg: "Promtail installation failed."
+  when: promtail_version_check.rc != 0
+
+- name: Create Promtail group
+  group:
+    name: promtail
+    state: present
+
+- name: Create Promtail user
+  user:
+    name: promtail
+    group: promtail
+    shell: /bin/bash
+    create_home: yes
+    home: /var/lib/promtail
+    system: yes
+
+- name: Add Promtail user to the adm group
+  user:
+    name: promtail
+    groups: adm
+    append: yes
+
+- name: Create Promtail directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /etc/promtail
+    - /etc/promtail/logs
+
+- name: Deploy Promtail configuration using template
+  template:
+    src: promtail-config.yaml.j2
+    dest: /etc/promtail/promtail-config.yaml
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create Promtail systemd service
+  template:
+    src: promtail-service.j2
+    dest: /etc/systemd/system/promtail.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd to apply Promtail service
+  systemd:
+    daemon_reload: yes
+
+- name: Start and enable Promtail service
+  systemd:
+    name: promtail
+    state: started
+    enabled: yes
